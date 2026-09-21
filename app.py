@@ -11,7 +11,7 @@ import streamlit as st
 # ============================================================
 
 BASE_DIR = Path(__file__).parent
-MASTER_FILE = BASE_DIR / "data" / "om_loading_master.xlsx"
+MASTER_FILE = BASE_DIR / "data" / "Om_Logistics_Loading_Master.xlsx"
 LOGO_FILE = BASE_DIR / "assets" / "om_logo.png"
 
 st.set_page_config(
@@ -95,46 +95,88 @@ st.markdown(
 
 @st.cache_data
 def load_master_data(master_path: Path):
-    truck_df = pd.read_excel(master_path, sheet_name="Truck_Master")
-    docket_df = pd.read_excel(master_path, sheet_name="Docket_Master")
 
-    # Clean column names to avoid errors because of extra spaces
+    truck_df = pd.read_excel(
+        master_path,
+        sheet_name="Truck_Master"
+    )
+
+    docket_master_df = pd.read_excel(
+        master_path,
+        sheet_name="Docket_Master"
+    )
+
+    docket_items_df = pd.read_excel(
+        master_path,
+        sheet_name="Docket_Items"
+    )
+
+    # Clean column names
     truck_df.columns = truck_df.columns.astype(str).str.strip()
-    docket_df.columns = docket_df.columns.astype(str).str.strip()
+    docket_master_df.columns = docket_master_df.columns.astype(str).str.strip()
+    docket_items_df.columns = docket_items_df.columns.astype(str).str.strip()
 
-    truck_df["Truck_ID"] = truck_df["Truck_ID"].astype(str).str.strip().str.upper()
-    docket_df["Docket_No"] = docket_df["Docket_No"].astype(str).str.strip().str.upper()
+    # Standardize IDs
+    truck_df["Truck_ID"] = (
+        truck_df["Truck_ID"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
-    # If truck volume column is missing, create it
+    docket_master_df["Docket_No"] = (
+        docket_master_df["Docket_No"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    docket_items_df["Docket_No"] = (
+        docket_items_df["Docket_No"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # Truck volume
     if "Truck_Volume_cuft" not in truck_df.columns:
         truck_df["Truck_Volume_cuft"] = (
-            truck_df["Length_ft"] *
-            truck_df["Width_ft"] *
-            truck_df["Height_ft"]
+            truck_df["Length_ft"]
+            * truck_df["Width_ft"]
+            * truck_df["Height_ft"]
         )
 
-    # If docket volume column is missing, create it
-    if "Volume_cuft" not in docket_df.columns:
-        docket_df["Volume_cuft"] = (
-            docket_df["Length_ft"] *
-            docket_df["Width_ft"] *
-            docket_df["Height_ft"]
+    # Unit volume of each physical package
+    docket_items_df["Unit_Volume_cuft"] = (
+        docket_items_df["Length_ft"]
+        * docket_items_df["Width_ft"]
+        * docket_items_df["Height_ft"]
+    )
+
+    # Total volume for each package line
+    docket_items_df["Line_Total_Volume_cuft"] = (
+        docket_items_df["Unit_Volume_cuft"]
+        * docket_items_df["Quantity"]
+    )
+
+    # If line total weight is missing
+    if "Line_Total_Weight_kg" not in docket_items_df.columns:
+        docket_items_df["Line_Total_Weight_kg"] = (
+            docket_items_df["Actual_Weight_kg"]
+            * docket_items_df["Quantity"]
         )
 
-    # Add optional columns automatically if missing
-    if "Stackable" not in docket_df.columns:
-        docket_df["Stackable"] = "Yes"
+    # Optional fields
+    if "Stackable" not in docket_items_df.columns:
+        docket_items_df["Stackable"] = "Yes"
 
-    if "Fragile" not in docket_df.columns:
-        docket_df["Fragile"] = "No"
+    if "Fragile" not in docket_items_df.columns:
+        docket_items_df["Fragile"] = "No"
 
-    if "Must_Upright" not in docket_df.columns:
-        docket_df["Must_Upright"] = "No"
+    if "Must_Upright" not in docket_items_df.columns:
+        docket_items_df["Must_Upright"] = "No"
 
-    if "Quantity" not in docket_df.columns:
-        docket_df["Quantity"] = 1
-
-    return truck_df, docket_df
+    return truck_df, docket_master_df, docket_items_df
 
 
 # ============================================================
@@ -162,6 +204,97 @@ def parse_docket_input(text):
 def yes_no(value):
     return str(value).strip().lower() == "yes"
 
+def expand_package_units(selected_items_df):
+    """
+    Converts package-line quantities into individual physical loading units.
+
+    Example:
+    D003 | Carton | Quantity 5
+
+    becomes:
+    D003-L1-U1
+    D003-L1-U2
+    D003-L1-U3
+    D003-L1-U4
+    D003-L1-U5
+    """
+
+    expanded_rows = []
+
+    for _, row in selected_items_df.iterrows():
+
+        quantity = int(row["Quantity"])
+
+        for unit_no in range(1, quantity + 1):
+
+            unit = row.copy()
+
+            unit["Unit_ID"] = (
+                f"{row['Docket_No']}"
+                f"-L{int(row['Line_No'])}"
+                f"-U{unit_no}"
+            )
+
+            unit["Unit_Number"] = unit_no
+
+            unit["Unit_Weight_kg"] = float(
+                row["Actual_Weight_kg"]
+            )
+
+            unit["Unit_Volume_cuft"] = (
+                float(row["Length_ft"])
+                * float(row["Width_ft"])
+                * float(row["Height_ft"])
+            )
+
+            unit["Quantity"] = 1
+
+            expanded_rows.append(unit)
+
+    return pd.DataFrame(expanded_rows)
+
+def get_allowed_orientations(item):
+
+    l = float(item["Length_ft"])
+    w = float(item["Width_ft"])
+    h = float(item["Height_ft"])
+
+    package_type = str(
+        item["Package_Type"]
+    ).strip().lower()
+
+    must_upright = yes_no(
+        item.get("Must_Upright", "No")
+    )
+
+    # Drums, pallets and crates should remain upright
+    if package_type in [
+        "drum",
+        "pallet",
+        "crate",
+        "wooden crate"
+    ]:
+        return list(set([
+            (l, w, h),
+            (w, l, h)
+        ]))
+
+    # Any package explicitly marked upright
+    if must_upright:
+        return list(set([
+            (l, w, h),
+            (w, l, h)
+        ]))
+
+    # Normal carton: all reasonable rotations allowed
+    return list(set([
+        (l, w, h),
+        (w, l, h),
+        (l, h, w),
+        (h, l, w),
+        (w, h, l),
+        (h, w, l)
+    ]))
 
 def assign_zone(priority, min_priority, max_priority):
     """
@@ -282,19 +415,7 @@ def find_position_for_box(item, placed_boxes, truck, preferred_zone):
             seen.add(zone)
             zones_to_try.append(zone)
 
-    original_l = float(item["Length_ft"])
-    original_w = float(item["Width_ft"])
-    original_h = float(item["Height_ft"])
-
-    # Allow horizontal rotation only: length-width rotation.
-    # Height remains same because many goods must remain upright.
-    if yes_no(item.get("Must_Upright", "No")):
-        orientations = [(original_l, original_w, original_h)]
-    else:
-        orientations = [
-            (original_l, original_w, original_h),
-            (original_w, original_l, original_h)
-        ]
+    orientations = get_allowed_orientations(item)
 
     for zone in zones_to_try:
         zone_start, zone_end = get_zone_range(zone, truck_length)
@@ -347,86 +468,190 @@ def find_position_for_box(item, placed_boxes, truck, preferred_zone):
     return None
 
 
-def create_loading_plan(selected_df, priority_df, truck):
-    final_df = selected_df.merge(priority_df, on="Docket_No", how="left")
+def create_loading_plan(selected_items_df, priority_df, truck):
 
-    final_df["Total_Volume_cuft"] = (
-        final_df["Length_ft"] *
-        final_df["Width_ft"] *
-        final_df["Height_ft"]
+    # Add unloading priority to every package line
+    working_df = selected_items_df.merge(
+        priority_df,
+        on="Docket_No",
+        how="left"
     )
 
-    # In this prototype, Actual_Weight_kg is treated as total docket weight.
-    final_df["Total_Weight_kg"] = final_df["Actual_Weight_kg"]
+    # Expand quantities into individual physical packages
+    final_df = expand_package_units(working_df)
 
-    min_priority = int(final_df["Unload_Priority"].min())
-    max_priority = int(final_df["Unload_Priority"].max())
-
-    final_df["Preferred_Zone"] = final_df["Unload_Priority"].apply(
-        lambda p: assign_zone(int(p), min_priority, max_priority)
+    min_priority = int(
+        final_df["Unload_Priority"].min()
     )
 
-    # Loading rule:
-    # unload later first, heavy and non-stackable items lower/earlier.
-    final_df["Stackable_Sort"] = final_df["Stackable"].apply(lambda x: 1 if str(x).lower() == "no" else 0)
-    final_df["Fragile_Sort"] = final_df["Fragile"].apply(lambda x: 1 if str(x).lower() == "yes" else 0)
+    max_priority = int(
+        final_df["Unload_Priority"].max()
+    )
+
+    final_df["Preferred_Zone"] = (
+        final_df["Unload_Priority"]
+        .apply(
+            lambda p: assign_zone(
+                int(p),
+                min_priority,
+                max_priority
+            )
+        )
+    )
+
+    # Sorting logic
+    # Higher priority number = unload later
+    # therefore load earlier / deeper inside
+
+    final_df["Stackable_Sort"] = (
+        final_df["Stackable"]
+        .apply(
+            lambda x: 1
+            if str(x).strip().lower() == "no"
+            else 0
+        )
+    )
+
+    final_df["Fragile_Sort"] = (
+        final_df["Fragile"]
+        .apply(
+            lambda x: 1
+            if str(x).strip().lower() == "yes"
+            else 0
+        )
+    )
 
     final_df = final_df.sort_values(
-        by=["Unload_Priority", "Stackable_Sort", "Fragile_Sort", "Total_Weight_kg", "Total_Volume_cuft"],
-        ascending=[False, False, True, False, False]
+        by=[
+            "Unload_Priority",
+            "Stackable_Sort",
+            "Fragile_Sort",
+            "Unit_Weight_kg",
+            "Unit_Volume_cuft"
+        ],
+        ascending=[
+            False,
+            False,
+            True,
+            False,
+            False
+        ]
     ).reset_index(drop=True)
 
-    final_df["Loading_Order"] = range(1, len(final_df) + 1)
+    final_df["Loading_Order"] = range(
+        1,
+        len(final_df) + 1
+    )
 
     placed_boxes = []
     unplaced_rows = []
 
     for _, row in final_df.iterrows():
-        position = find_position_for_box(row, placed_boxes, truck, row["Preferred_Zone"])
+
+        position = find_position_for_box(
+            row,
+            placed_boxes,
+            truck,
+            row["Preferred_Zone"]
+        )
 
         if position is None:
-            unplaced_rows.append(row["Docket_No"])
+
+            unplaced_rows.append(
+                row["Unit_ID"]
+            )
+
             continue
 
         warning_notes = []
 
-        if row["Fragile"] == "Yes":
-            warning_notes.append("Fragile: avoid heavy stacking")
+        if yes_no(row["Fragile"]):
+            warning_notes.append(
+                "Fragile: avoid heavy stacking"
+            )
 
-        if row["Stackable"] == "No":
-            warning_notes.append("Non-stackable: keep floor preference")
+        if not yes_no(row["Stackable"]):
+            warning_notes.append(
+                "Non-stackable: floor preference"
+            )
 
-        if row["Preferred_Zone"] != position["Actual_Zone_Used"]:
-            warning_notes.append("Placed outside preferred zone due to fit constraints")
+        if (
+            row["Preferred_Zone"]
+            != position["Actual_Zone_Used"]
+        ):
+            warning_notes.append(
+                "Placed outside preferred zone due to fit constraints"
+            )
 
         placed_box = {
+
+            "Unit_ID": row["Unit_ID"],
+
             "Docket_No": row["Docket_No"],
-            "Item_Type": row["Item_Type"],
-            "Quantity": row["Quantity"],
-            "Unload_Priority": int(row["Unload_Priority"]),
-            "Loading_Order": int(row["Loading_Order"]),
-            "Preferred_Zone": row["Preferred_Zone"],
-            "Actual_Zone_Used": position["Actual_Zone_Used"],
+
+            "Line_No": int(row["Line_No"]),
+
+            "Package_Type": row["Package_Type"],
+
+            "Unload_Priority": int(
+                row["Unload_Priority"]
+            ),
+
+            "Loading_Order": int(
+                row["Loading_Order"]
+            ),
+
+            "Preferred_Zone": row[
+                "Preferred_Zone"
+            ],
+
+            "Actual_Zone_Used": position[
+                "Actual_Zone_Used"
+            ],
+
             "x": position["x"],
             "y": position["y"],
             "z": position["z"],
+
             "l": position["l"],
             "w": position["w"],
             "h": position["h"],
-            "Weight_kg": row["Total_Weight_kg"],
-            "Volume_cuft": row["Total_Volume_cuft"],
+
+            "Weight_kg": float(
+                row["Unit_Weight_kg"]
+            ),
+
+            "Volume_cuft": float(
+                row["Unit_Volume_cuft"]
+            ),
+
             "Stackable": row["Stackable"],
+
             "Fragile": row["Fragile"],
-            "Must_Upright": row["Must_Upright"],
-            "Warning_Note": "; ".join(warning_notes) if warning_notes else "OK"
+
+            "Must_Upright": row[
+                "Must_Upright"
+            ],
+
+            "Warning_Note":
+                "; ".join(warning_notes)
+                if warning_notes
+                else "OK"
         }
 
-        placed_boxes.append(placed_box)
+        placed_boxes.append(
+            placed_box
+        )
 
-    placement_df = pd.DataFrame(placed_boxes)
+    placement_df = pd.DataFrame(
+        placed_boxes
+    )
 
-    return final_df, placement_df, unplaced_rows
-
+    return (
+        final_df,
+        placement_df,
+        unplaced_rows
+    )
 
 def create_truck_3d_figure(placement_df, truck):
     truck_length = float(truck["Length_ft"])
@@ -487,6 +712,17 @@ def create_truck_3d_figure(placement_df, truck):
         "#2563eb", "#16a34a", "#dc2626", "#9333ea", "#ea580c",
         "#0891b2", "#65a30d", "#be123c", "#7c3aed", "#ca8a04"
     ]
+    unique_dockets = list(
+        placement_df["Docket_No"].unique()
+    )
+
+    docket_color_map = {
+        docket: color_list[
+            i % len(color_list)
+        ]
+        for i, docket
+        in enumerate(unique_dockets)
+    }
 
     for idx, row in placement_df.iterrows():
         x0, y0, z0 = row["x"], row["y"], row["z"]
@@ -520,29 +756,43 @@ def create_truck_3d_figure(placement_df, truck):
                 j=j,
                 k=k,
                 opacity=0.65,
-                color=color_list[idx % len(color_list)],
+                color=docket_color_map[
+                    row["Docket_No"]
+                ],
                 name=str(row["Docket_No"]),
                 hovertext=(
-                    f"Docket: {row['Docket_No']}<br>"
-                    f"Type: {row['Item_Type']}<br>"
+                    f"<b>Docket: {row['Docket_No']}</b><br>"
+                    f"Unit: {row['Unit_ID']}<br>"
+                    f"Package: {row['Package_Type']}<br>"
+                    f"Dimensions: "
+                    f"{row['l']:.2f} × "
+                    f"{row['w']:.2f} × "
+                    f"{row['h']:.2f} ft<br>"
+                    f"Weight: {row['Weight_kg']:.1f} kg<br>"
+                    f"Unload priority: {row['Unload_Priority']}<br>"
+                    f"Loading order: {row['Loading_Order']}<br>"
                     f"Zone: {row['Actual_Zone_Used']}<br>"
-                    f"Load order: {row['Loading_Order']}<br>"
-                    f"Unload priority: {row['Unload_Priority']}"
+                    f"Stackable: {row['Stackable']}<br>"
+                    f"Fragile: {row['Fragile']}"
                 ),
                 hoverinfo="text",
-                showlegend=True
+                showlegend=False
             )
         )
 
+    for docket, color in docket_color_map.items():
         fig.add_trace(
             go.Scatter3d(
-                x=[(x0 + x1) / 2],
-                y=[(y0 + y1) / 2],
-                z=[(z0 + z1) / 2],
-                mode="text",
-                text=[row["Docket_No"]],
-                textposition="middle center",
-                showlegend=False
+                x=[None],
+                y=[None],
+                z=[None],
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color=color
+                ),
+                name=docket,
+                showlegend=True
             )
         )
 
@@ -627,7 +877,7 @@ if not MASTER_FILE.exists():
     st.code("python create_sample_excel.py")
     st.stop()
 
-truck_df, docket_df = load_master_data(MASTER_FILE)
+truck_df, docket_master_df, docket_items_df = load_master_data(MASTER_FILE)
 
 
 # ============================================================
@@ -647,12 +897,12 @@ with st.sidebar:
     st.dataframe(
         truck_df[[
             "Truck_ID",
-            "Truck_No",
             "Truck_Type",
             "Length_ft",
             "Width_ft",
             "Height_ft",
             "Max_Weight_kg",
+            "Truck_Volume_cuft"
         ]],
         hide_index=True,
         width='stretch'
@@ -698,8 +948,10 @@ docket_text = st.text_area(
 
 selected_dockets = parse_docket_input(docket_text)
 
-matched_df = docket_df[docket_df["Docket_No"].isin(selected_dockets)].copy()
-
+matched_df = docket_master_df[docket_master_df["Docket_No"].isin(selected_dockets)].copy()
+selected_items_df = docket_items_df[
+    docket_items_df["Docket_No"].isin(selected_dockets)
+].copy()
 missing_dockets = [d for d in selected_dockets if d not in matched_df["Docket_No"].tolist()]
 
 if missing_dockets:
@@ -711,6 +963,12 @@ if matched_df.empty:
 
 st.write("Extracted docket details from master Excel:")
 st.dataframe(matched_df, hide_index=True, width='stretch')
+with st.expander("Show package details inside selected dockets"):
+    st.dataframe(
+        selected_items_df,
+        hide_index=True,
+        width="stretch"
+    )
 
 # st.markdown('</div>', unsafe_allow_html=True)
 
@@ -763,13 +1021,18 @@ generate = st.button("Generate Loading Plan", type="primary", width='stretch')
 
 if generate:
     final_df, placement_df, unplaced_rows = create_loading_plan(
-        matched_df,
+        selected_items_df,
         priority_df,
         truck
     )
 
-    total_weight = final_df["Total_Weight_kg"].sum()
-    total_volume = final_df["Total_Volume_cuft"].sum()
+    total_weight = final_df[
+        "Unit_Weight_kg"
+    ].sum()
+
+    total_volume = final_df[
+        "Unit_Volume_cuft"
+    ].sum()
 
     truck_weight = float(truck["Max_Weight_kg"])
     truck_volume = float(truck["Truck_Volume_cuft"])
@@ -777,8 +1040,15 @@ if generate:
     weight_utilization = (total_weight / truck_weight) * 100
     volume_utilization = (total_volume / truck_volume) * 100
 
-    unused_weight = truck_weight - total_weight
-    unused_volume = truck_volume - total_volume
+    unused_weight = max(
+        truck_weight - total_weight,
+        0
+    )
+
+    unused_volume = max(
+        truck_volume - total_volume,
+        0
+    )
 
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("4. Loading Feasibility Dashboard")
@@ -799,7 +1069,10 @@ if generate:
         warnings.append("Total volume exceeds truck internal volume.")
 
     if unplaced_rows:
-        warnings.append(f"Could not place these dockets in 3D layout: {', '.join(unplaced_rows)}")
+        warnings.append(
+            f"Could not place these package units in the 3D layout: "
+            f"{', '.join(unplaced_rows)}"
+        )
 
     if warnings:
         st.markdown(
@@ -828,9 +1101,9 @@ if generate:
     if not placement_df.empty:
         output_cols = [
             "Loading_Order",
+            "Unit_ID",
             "Docket_No",
-            "Item_Type",
-            "Quantity",
+            "Package_Type",
             "Unload_Priority",
             "Preferred_Zone",
             "Actual_Zone_Used",
@@ -838,6 +1111,7 @@ if generate:
             "Volume_cuft",
             "Stackable",
             "Fragile",
+            "Must_Upright",
             "Warning_Note"
         ]
 
@@ -889,7 +1163,10 @@ if generate:
 
         with st.expander("Show 3D coordinate table"):
             coord_cols = [
+                "Unit_ID",
                 "Docket_No",
+                "Package_Type",
+                "Unload_Priority",
                 "x",
                 "y",
                 "z",
