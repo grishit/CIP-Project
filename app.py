@@ -296,39 +296,58 @@ def get_allowed_orientations(item):
         (h, w, l)
     ]))
 
-def assign_zone(priority, min_priority, max_priority):
+def build_priority_zone_map(priority_values, truck_length):
     """
-    Unload priority:
-    1 = unload first
-    higher number = unload later
+    Creates one truck-depth band for every unloading priority.
 
-    Loading rule:
-    unload later = load first = front/deep
-    unload first = load last = rear/near door
+    Priority 1 = unload first = near rear door
+    Highest priority number = unload last = deepest/front
+
+    x = 0             -> Front / Cab
+    x = truck_length  -> Rear Door
     """
-    if min_priority == max_priority:
-        return "Full Truck / Balanced"
 
-    if priority == min_priority:
-        return "Rear / Near Door"
+    priorities = sorted(
+        {int(p) for p in priority_values},
+        reverse=True
+    )
 
-    if priority == max_priority:
-        return "Front / Deep Inside"
+    if not priorities:
+        return {}
 
-    return "Middle Zone"
+    number_of_zones = len(priorities)
+    zone_length = truck_length / number_of_zones
 
+    zone_map = {}
 
-def get_zone_range(zone, truck_length):
-    one_third = truck_length / 3
+    for index, priority in enumerate(priorities):
 
-    zone_map = {
-        "Front / Deep Inside": (0, one_third),
-        "Middle Zone": (one_third, 2 * one_third),
-        "Rear / Near Door": (2 * one_third, truck_length),
-        "Full Truck / Balanced": (0, truck_length)
-    }
+        start = index * zone_length
 
-    return zone_map.get(zone, (0, truck_length))
+        if index == number_of_zones - 1:
+            end = truck_length
+        else:
+            end = (index + 1) * zone_length
+
+        if number_of_zones == 1:
+            label = f"Priority {priority} / Full Truck"
+
+        elif index == 0:
+            label = f"Priority {priority} / Front - Deep"
+
+        elif index == number_of_zones - 1:
+            label = f"Priority {priority} / Rear - Door"
+
+        else:
+            label = f"Priority {priority} / Zone {index + 1}"
+
+        zone_map[priority] = {
+            "start": start,
+            "end": end,
+            "label": label
+        }
+
+    return zone_map
 
 
 def interval_overlap(a_start, a_end, b_start, b_end):
@@ -348,31 +367,89 @@ def xy_overlap(a, b):
     return x_overlap and y_overlap
 
 
-def support_is_allowed(candidate, placed_boxes):
+def support_is_allowed(
+    candidate,
+    placed_boxes,
+    minimum_support_ratio=0.75
+):
     """
-    If box is on floor, allowed.
-    If box is above floor, it must sit on boxes that are stackable and not fragile.
-    This is simplified prototype logic.
+    Package placed above floor must have at least
+    75% of its base supported by valid packages below.
     """
-    if candidate["z"] == 0:
+
+    if candidate["z"] <= 0.001:
         return True
 
-    support_found = False
+    candidate_area = (
+        candidate["l"]
+        * candidate["w"]
+    )
+
+    supported_area = 0.0
 
     for box in placed_boxes:
-        top_of_box = box["z"] + box["h"]
 
-        if abs(top_of_box - candidate["z"]) < 0.001 and xy_overlap(candidate, box):
-            support_found = True
+        top_of_box = (
+            box["z"]
+            + box["h"]
+        )
 
-            if box["Stackable"] == "No":
-                return False
+        if abs(
+            top_of_box
+            - candidate["z"]
+        ) > 0.001:
+            continue
 
-            if box["Fragile"] == "Yes":
-                return False
+        # Cannot stack on non-stackable package
+        if not yes_no(
+            box["Stackable"]
+        ):
+            continue
 
-    return support_found
+        # Cannot stack on fragile package
+        if yes_no(
+            box["Fragile"]
+        ):
+            continue
 
+        x_overlap = max(
+            0,
+            min(
+                candidate["x"] + candidate["l"],
+                box["x"] + box["l"]
+            )
+            - max(
+                candidate["x"],
+                box["x"]
+            )
+        )
+
+        y_overlap = max(
+            0,
+            min(
+                candidate["y"] + candidate["w"],
+                box["y"] + box["w"]
+            )
+            - max(
+                candidate["y"],
+                box["y"]
+            )
+        )
+
+        supported_area += (
+            x_overlap
+            * y_overlap
+        )
+
+    support_ratio = (
+        supported_area
+        / candidate_area
+    )
+
+    return (
+        support_ratio
+        >= minimum_support_ratio
+    )
 
 def build_candidate_positions(placed_boxes, zone_start):
     x_candidates = {round(zone_start, 3)}
@@ -393,80 +470,82 @@ def build_candidate_positions(placed_boxes, zone_start):
 
     return candidates
 
+def find_position_for_box(
+    item,
+    placed_boxes,
+    truck,
+    zone_start,
+    zone_end,
+    zone_label
+):
 
-def find_position_for_box(item, placed_boxes, truck, preferred_zone):
-    truck_length = float(truck["Length_ft"])
     truck_width = float(truck["Width_ft"])
     truck_height = float(truck["Height_ft"])
 
-    preferred_zones = [
-        preferred_zone,
-        "Front / Deep Inside",
-        "Middle Zone",
-        "Rear / Near Door",
-        "Full Truck / Balanced"
-    ]
-
-    seen = set()
-    zones_to_try = []
-
-    for zone in preferred_zones:
-        if zone not in seen:
-            seen.add(zone)
-            zones_to_try.append(zone)
-
     orientations = get_allowed_orientations(item)
 
-    for zone in zones_to_try:
-        zone_start, zone_end = get_zone_range(zone, truck_length)
+    for l, w, h in orientations:
 
-        for l, w, h in orientations:
-            candidate_positions = build_candidate_positions(placed_boxes, zone_start)
+        candidate_positions = build_candidate_positions(
+            placed_boxes,
+            zone_start
+        )
 
-            for x, y, z in candidate_positions:
-                candidate = {
-                    "x": x,
-                    "y": y,
-                    "z": z,
-                    "l": l,
-                    "w": w,
-                    "h": h,
-                    "Stackable": item["Stackable"],
-                    "Fragile": item["Fragile"]
-                }
+        for x, y, z in candidate_positions:
 
-                if x < zone_start:
-                    continue
+            candidate = {
+                "x": x,
+                "y": y,
+                "z": z,
+                "l": l,
+                "w": w,
+                "h": h,
+                "Stackable": item["Stackable"],
+                "Fragile": item["Fragile"]
+            }
 
-                if x + l > zone_end:
-                    continue
+            # Must remain inside its LIFO priority zone
+            if x < zone_start:
+                continue
 
-                if y + w > truck_width:
-                    continue
+            if x + l > zone_end:
+                continue
 
-                if z + h > truck_height:
-                    continue
+            # Truck width
+            if y + w > truck_width:
+                continue
 
-                collision = any(boxes_overlap(candidate, box) for box in placed_boxes)
+            # Truck height
+            if z + h > truck_height:
+                continue
 
-                if collision:
-                    continue
+            # Collision check
+            collision = any(
+                boxes_overlap(candidate, box)
+                for box in placed_boxes
+            )
 
-                if not support_is_allowed(candidate, placed_boxes):
-                    continue
+            if collision:
+                continue
 
-                return {
-                    "x": x,
-                    "y": y,
-                    "z": z,
-                    "l": l,
-                    "w": w,
-                    "h": h,
-                    "Actual_Zone_Used": zone
-                }
+            # Stacking/support check
+            if not support_is_allowed(
+                candidate,
+                placed_boxes
+            ):
+                continue
+
+            return {
+                "x": x,
+                "y": y,
+                "z": z,
+                "l": l,
+                "w": w,
+                "h": h,
+                "Actual_Zone_Used": zone_label
+            }
 
     return None
-
 
 def create_loading_plan(selected_items_df, priority_df, truck):
 
@@ -480,25 +559,30 @@ def create_loading_plan(selected_items_df, priority_df, truck):
     # Expand quantities into individual physical packages
     final_df = expand_package_units(working_df)
 
-    min_priority = int(
-        final_df["Unload_Priority"].min()
+    truck_length = float(truck["Length_ft"])
+
+    priority_zone_map = build_priority_zone_map(
+        final_df["Unload_Priority"],
+        truck_length
     )
 
-    max_priority = int(
-        final_df["Unload_Priority"].max()
+    final_df["Preferred_Zone"] = final_df[
+        "Unload_Priority"
+    ].apply(
+        lambda p: priority_zone_map[int(p)]["label"]
     )
 
-    final_df["Preferred_Zone"] = (
-        final_df["Unload_Priority"]
-        .apply(
-            lambda p: assign_zone(
-                int(p),
-                min_priority,
-                max_priority
-            )
-        )
+    final_df["Zone_Start"] = final_df[
+        "Unload_Priority"
+    ].apply(
+        lambda p: priority_zone_map[int(p)]["start"]
     )
 
+    final_df["Zone_End"] = final_df[
+        "Unload_Priority"
+    ].apply(
+        lambda p: priority_zone_map[int(p)]["end"]
+    )
     # Sorting logic
     # Higher priority number = unload later
     # therefore load earlier / deeper inside
@@ -546,20 +630,51 @@ def create_loading_plan(selected_items_df, priority_df, truck):
     placed_boxes = []
     unplaced_rows = []
 
+    current_loaded_weight = 0.0
+    max_truck_weight = float(
+        truck["Max_Weight_kg"]
+    )
+
     for _, row in final_df.iterrows():
+
+        unit_weight = float(
+            row["Unit_Weight_kg"]
+        )
+
+        if (
+            current_loaded_weight
+            + unit_weight
+            > max_truck_weight
+        ):
+
+            unplaced_rows.append({
+                "Unit_ID": row["Unit_ID"],
+                "Docket_No": row["Docket_No"],
+                "Package_Type": row["Package_Type"],
+                "Reason": "Truck payload capacity exceeded"
+            })
+
+            continue
 
         position = find_position_for_box(
             row,
             placed_boxes,
             truck,
+            float(row["Zone_Start"]),
+            float(row["Zone_End"]),
             row["Preferred_Zone"]
         )
 
         if position is None:
 
-            unplaced_rows.append(
-                row["Unit_ID"]
-            )
+            unplaced_rows.append({
+                "Unit_ID": row["Unit_ID"],
+                "Docket_No": row["Docket_No"],
+                "Package_Type": row["Package_Type"],
+                "Reason":
+                    "No feasible 3D position available "
+                    "inside assigned LIFO priority zone"
+            })
 
             continue
 
@@ -643,6 +758,8 @@ def create_loading_plan(selected_items_df, priority_df, truck):
             placed_box
         )
 
+        current_loaded_weight += unit_weight
+
     placement_df = pd.DataFrame(
         placed_boxes
     )
@@ -653,7 +770,64 @@ def create_loading_plan(selected_items_df, priority_df, truck):
         unplaced_rows
     )
 
-def create_truck_3d_figure(placement_df, truck):
+def add_box_edges(
+    fig,
+    x0, y0, z0,
+    x1, y1, z1,
+    color="#334155"
+):
+    """
+    Draw visible edges around one 3D package.
+    This makes individual packages easier to distinguish,
+    even when they belong to the same docket colour.
+    """
+
+    edges = [
+        # Bottom face
+        [(x0, y0, z0), (x1, y0, z0)],
+        [(x1, y0, z0), (x1, y1, z0)],
+        [(x1, y1, z0), (x0, y1, z0)],
+        [(x0, y1, z0), (x0, y0, z0)],
+
+        # Top face
+        [(x0, y0, z1), (x1, y0, z1)],
+        [(x1, y0, z1), (x1, y1, z1)],
+        [(x1, y1, z1), (x0, y1, z1)],
+        [(x0, y1, z1), (x0, y0, z1)],
+
+        # Vertical edges
+        [(x0, y0, z0), (x0, y0, z1)],
+        [(x1, y0, z0), (x1, y0, z1)],
+        [(x1, y1, z0), (x1, y1, z1)],
+        [(x0, y1, z0), (x0, y1, z1)],
+    ]
+
+    for edge in edges:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[
+                    edge[0][0],
+                    edge[1][0]
+                ],
+                y=[
+                    edge[0][1],
+                    edge[1][1]
+                ],
+                z=[
+                    edge[0][2],
+                    edge[1][2]
+                ],
+                mode="lines",
+                line=dict(
+                    color=color,
+                    width=2
+                ),
+                showlegend=False,
+                hoverinfo="skip"
+            )
+        )
+
+def create_truck_3d_figure(placement_df, truck, priority_df):
     truck_length = float(truck["Length_ft"])
     truck_width = float(truck["Width_ft"])
     truck_height = float(truck["Height_ft"])
@@ -695,15 +869,50 @@ def create_truck_3d_figure(placement_df, truck):
         )
 
     # Zone divider lines
-    for x_div in [truck_length / 3, 2 * truck_length / 3]:
+    priority_zone_map = build_priority_zone_map(
+        priority_df["Unload_Priority"],
+        truck_length
+    )
+
+    zone_boundaries = sorted({
+        round(zone["end"], 4)
+        for zone in priority_zone_map.values()
+        if zone["end"] < truck_length
+    })
+
+    for x_div in zone_boundaries:
+
         fig.add_trace(
             go.Scatter3d(
-                x=[x_div, x_div, x_div, x_div, x_div],
-                y=[0, truck_width, truck_width, 0, 0],
-                z=[0, 0, truck_height, truck_height, 0],
+                x=[
+                    x_div,
+                    x_div,
+                    x_div,
+                    x_div,
+                    x_div
+                ],
+                y=[
+                    0,
+                    truck_width,
+                    truck_width,
+                    0,
+                    0
+                ],
+                z=[
+                    0,
+                    0,
+                    truck_height,
+                    truck_height,
+                    0
+                ],
                 mode="lines",
-                line=dict(width=3, dash="dash"),
-                showlegend=False
+                line=dict(
+                    width=3,
+                    dash="dash",
+                    color="red"
+                ),
+                showlegend=False,
+                hoverinfo="skip"
             )
         )
 
@@ -723,6 +932,11 @@ def create_truck_3d_figure(placement_df, truck):
         for i, docket
         in enumerate(unique_dockets)
     }
+    add_box_edges(
+        fig,
+        x0, y0, z0,
+        x1, y1, z1
+    )
 
     for idx, row in placement_df.iterrows():
         x0, y0, z0 = row["x"], row["y"], row["z"]
@@ -755,7 +969,7 @@ def create_truck_3d_figure(placement_df, truck):
                 i=i,
                 j=j,
                 k=k,
-                opacity=0.65,
+                opacity=0.92,
                 color=docket_color_map[
                     row["Docket_No"]
                 ],
@@ -1069,9 +1283,21 @@ if generate:
         warnings.append("Total volume exceeds truck internal volume.")
 
     if unplaced_rows:
-        warnings.append(
-            f"Could not place these package units in the 3D layout: "
-            f"{', '.join(unplaced_rows)}"
+         warnings.append(
+            f"{len(unplaced_rows)} physical package unit(s) "
+            f"could not be loaded."
+        )
+    if unplaced_rows:
+        st.subheader("Unplaced Package Details")
+
+        unplaced_df = pd.DataFrame(
+            unplaced_rows
+        )
+
+        st.dataframe(
+            unplaced_df,
+            hide_index=True,
+            width="stretch"
         )
 
     if warnings:
@@ -1158,7 +1384,7 @@ if generate:
     st.subheader("7. 3D Virtual Truck Layout")
 
     if not placement_df.empty:
-        fig = create_truck_3d_figure(placement_df, truck)
+        fig = create_truck_3d_figure(placement_df, truck, priority_df)
         st.plotly_chart(fig, width='stretch')
 
         with st.expander("Show 3D coordinate table"):
