@@ -932,11 +932,6 @@ def create_truck_3d_figure(placement_df, truck, priority_df):
         for i, docket
         in enumerate(unique_dockets)
     }
-    add_box_edges(
-        fig,
-        x0, y0, z0,
-        x1, y1, z1
-    )
 
     for idx, row in placement_df.iterrows():
         x0, y0, z0 = row["x"], row["y"], row["z"]
@@ -993,7 +988,12 @@ def create_truck_3d_figure(placement_df, truck, priority_df):
                 showlegend=False
             )
         )
-
+        add_box_edges(
+            fig,
+            x0, y0, z0,
+            x1, y1, z1
+        )
+        
     for docket, color in docket_color_map.items():
         fig.add_trace(
             go.Scatter3d(
